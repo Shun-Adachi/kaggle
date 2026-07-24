@@ -1,0 +1,17 @@
+# data (kaggle CLI で再取得可能)
+competitions/*/data/
+*.zip
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# misc
+.DS_Store
+*.log
+
+# 個人層(別リポジトリで管理)
+.claude/
+CLAUDE.local.md
