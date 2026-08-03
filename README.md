@@ -7,7 +7,7 @@ Kaggle コンペティションへの取り組みをまとめたリポジトリ�
 
 | コンペ | 状況 | ベストスコア (CV / LB) |
 | --- | --- | --- |
-| [Titanic](competitions/titanic/) | 準備中 | - |
+| [Titanic](competitions/titanic/) | 完了 | 0.843 (repeated CV) / **0.77751**(上位29.9%) |
 
 ## セットアップ
 
