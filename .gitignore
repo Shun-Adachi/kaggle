@@ -10,6 +10,11 @@ __pycache__/
 
 # 実験結果(ローカルにのみ保存。図・誤答CSV等は再実行で再現可能)
 competitions/*/notebooks/figures/error_analysis/
+competitions/*/notebooks/figures/lb_position/
+competitions/*/notebooks/figures/test_gap/
+competitions/*/notebooks/figures/train_test_shift/
+competitions/*/notebooks/figures/hard_segments/
+competitions/*/notebooks/figures/age_imputation/
 
 # misc
 .DS_Store

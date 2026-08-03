@@ -101,6 +101,45 @@ FEATURE_SETS = {
         "num": BASE_NUM + TICKET_NUM + WC_NUM + ["CabinFlag"],
         "cat": BASE_CAT + ["Deck"], "title_age": True, "group": "wc", "group_key": "ExtGroupId",
     },
+    # male C1 深掘り(2026-08-03): 大人の男性に WCG 証拠を渡さない(rate=1 の誤読による FP 防止)
+    "wcg2scm": {
+        "num": BASE_NUM + TICKET_NUM + WC_NUM + ["CabinFlag"],
+        "cat": BASE_CAT + ["Deck"], "title_age": True, "group": "wc", "group_key": "ExtGroupId",
+        "wc_mask_men": True,
+    },
+    # male C1 深掘り: Age 欠損フラグ(欠損者は低生存率なのに中央値補完で高生存帯に混入する問題)
+    "wcg2sca": {
+        "num": BASE_NUM + TICKET_NUM + WC_NUM + ["CabinFlag", "AgeMissing"],
+        "cat": BASE_CAT + ["Deck"], "title_age": True, "group": "wc", "group_key": "ExtGroupId",
+    },
+    # 上2つの併用
+    "wcg2scma": {
+        "num": BASE_NUM + TICKET_NUM + WC_NUM + ["CabinFlag", "AgeMissing"],
+        "cat": BASE_CAT + ["Deck"], "title_age": True, "group": "wc", "group_key": "ExtGroupId",
+        "wc_mask_men": True,
+    },
+    # 証拠は消さず「女性・子供か」の条件分岐だけ明示する案(ペア比較 全体+2.2人・7勝2敗の傾向。
+    # LB 検証で 2勝4敗 → 棄却)
+    "wcg2scw": {
+        "num": BASE_NUM + TICKET_NUM + WC_NUM + ["CabinFlag", "IsWC"],
+        "cat": BASE_CAT + ["Deck"], "title_age": True, "group": "wc", "group_key": "ExtGroupId",
+    },
+    # Age 補完の精緻化(2026-08-03): Title×Pclass 中央値(MAE 9.41→8.93歳。
+    # 欠損の Mr C1 が 30歳→40歳になり実際の低生存率と整合する帯に入る)
+    "wcg2scp": {
+        "num": BASE_NUM + TICKET_NUM + WC_NUM + ["CabinFlag"],
+        "cat": BASE_CAT + ["Deck"], "title_age": "pclass", "group": "wc", "group_key": "ExtGroupId",
+    },
+    # Age 補完の精緻化: LGBM 回帰補完(MAE 8.62歳)
+    "wcg2scr": {
+        "num": BASE_NUM + TICKET_NUM + WC_NUM + ["CabinFlag"],
+        "cat": BASE_CAT + ["Deck"], "title_age": "reg", "group": "wc", "group_key": "ExtGroupId",
+    },
+    # Age 補完の精緻化: 親同伴の Miss を女児として補完(TitleFine 別中央値)
+    "wcg2scf": {
+        "num": BASE_NUM + TICKET_NUM + WC_NUM + ["CabinFlag"],
+        "cat": BASE_CAT + ["Deck"], "title_age": "fine", "group": "wc", "group_key": "ExtGroupId",
+    },
 }
 
 TITLE_MAP = {"Mlle": "Miss", "Ms": "Miss", "Mme": "Mrs"}
@@ -117,25 +156,87 @@ LGBM_TUNED = {
     "wcg2s": _WCG2_PARAMS,
     "wcg2c": _WCG2_PARAMS,
     "wcg2sc": _WCG2_PARAMS,
+    "wcg2scm": _WCG2_PARAMS,
+    "wcg2sca": _WCG2_PARAMS,
+    "wcg2scma": _WCG2_PARAMS,
+    "wcg2scw": _WCG2_PARAMS,
+    "wcg2scp": _WCG2_PARAMS,
+    "wcg2scr": _WCG2_PARAMS,
+    "wcg2scf": _WCG2_PARAMS,
 }
 
 
 class TitleAgeImputer(BaseEstimator, TransformerMixin):
-    """Age の欠損を Title 別中央値で埋める。
+    """Age の欠損を Title(既定)または Title×Pclass 別中央値で埋める。
 
     中央値は fit したデータ(CV では学習フォールドのみ)から学ぶことでリークを防ぐ。
-    未知の Title は全体中央値にフォールバック。
+    セルが無い場合は Title 別 → 全体中央値へフォールバック。
+    Title×Pclass は補完 MAE 9.41 → 8.93 歳(Mr は C1=40 / C2=31 / C3=26 歳と階級差が大きい)。
     """
 
+    def __init__(self, by=("Title",)):
+        self.by = by
+
+    @staticmethod
+    def _with_derived(X: pd.DataFrame) -> pd.DataFrame:
+        X = X.copy()
+        # TitleFine: 親同伴の Miss は女児の可能性が高い(年齢既知では中央値9歳。
+        # 一律 Miss=21歳で埋めると子供が大人扱いになる)。パイプラインには
+        # 特徴セットの列しか渡らないため、Title と Parch からここで導出する
+        if "TitleFine" not in X.columns:
+            X["TitleFine"] = X["Title"].where(
+                ~((X["Title"] == "Miss") & (X["Parch"] > 0)), "MissChild")
+        return X
+
     def fit(self, X, y=None):
-        self.medians_ = X.groupby("Title")["Age"].median()
+        X = self._with_derived(X)
+        self.medians_ = X.groupby(list(self.by))["Age"].median()
+        self.title_medians_ = X.groupby("Title")["Age"].median()
         self.fallback_ = X["Age"].median()
         return self
 
     def transform(self, X):
-        X = X.copy()
-        fill = X["Title"].map(self.medians_).fillna(self.fallback_)
+        X = self._with_derived(X)
+        if len(self.by) == 1:
+            fill = X[self.by[0]].map(self.medians_)
+        else:
+            key = pd.MultiIndex.from_frame(X[list(self.by)])
+            fill = pd.Series(self.medians_.reindex(key).to_numpy(), index=X.index)
+        fill = fill.fillna(X["Title"].map(self.title_medians_)).fillna(self.fallback_)
         X["Age"] = X["Age"].fillna(fill)
+        return X.drop(columns=["TitleFine"])
+
+
+class RegAgeImputer(BaseEstimator, TransformerMixin):
+    """Age の欠損を他の属性からの LightGBM 回帰で補完する(補完 MAE 8.62 歳)。
+
+    回帰モデルは fit したデータの Age 既知行のみから学習(リーク防止は Title 版と同じ理屈)。
+    """
+
+    COLS = ["Pclass", "SibSp", "Parch", "Fare", "FamilySize", "TicketGroupSize", "FarePerPerson"]
+    CATS = {"Title": ["Mr", "Miss", "Mrs", "Master", "Rare"],
+            "Sex": ["male", "female"], "Embarked": ["S", "C", "Q"]}
+
+    def _enc(self, X: pd.DataFrame) -> pd.DataFrame:
+        out = X[self.COLS].copy()
+        for c, vals in self.CATS.items():
+            for v in vals:
+                out[f"{c}_{v}"] = (X[c] == v).astype(int)
+        return out
+
+    def fit(self, X, y=None):
+        from lightgbm import LGBMRegressor
+        known = X[X["Age"].notna()]
+        self.model_ = LGBMRegressor(n_estimators=200, learning_rate=0.05, num_leaves=15,
+                                    random_state=SEED, verbose=-1)
+        self.model_.fit(self._enc(known), known["Age"])
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        miss = X["Age"].isna()
+        if miss.any():
+            X.loc[miss, "Age"] = self.model_.predict(self._enc(X[miss]))
         return X
 
 
@@ -145,6 +246,12 @@ def add_features(df: pd.DataFrame, ticket_counts: pd.Series) -> pd.DataFrame:
     title = title.replace(TITLE_MAP)
     out["Title"] = title.where(title.isin(COMMON_TITLES), "Rare")
     out["FamilySize"] = out["SibSp"] + out["Parch"] + 1
+    # Age が記録されていないこと自体が情報(male C1 では欠損者の生存率 23.8% に対し、
+    # Title別中央値補完で 30歳=最も生存率の高い帯に混入してしまう)
+    out["AgeMissing"] = out["Age"].isna().astype(int)
+    # WCG 証拠の効き方は女性・子供と大人の男性で別(rate=1 でも大人の男性の生存率 27.7%)。
+    # その条件分岐を木に1分割で学ばせるための明示フラグ
+    out["IsWC"] = ((out["Sex"] == "female") | (out["Title"] == "Master")).astype(int)
     # 同一チケット = 同行グループ。人数は train+test 合算で数える(ラベルは使わない)
     out["TicketGroupSize"] = out["Ticket"].map(ticket_counts)
     out["FarePerPerson"] = out["Fare"] / out["TicketGroupSize"]
@@ -194,7 +301,8 @@ def _extended_group_ids(all_df: pd.DataFrame) -> np.ndarray:
 
 
 def add_group_feature(train_part: pd.DataFrame, target: pd.DataFrame,
-                      wc_only: bool = False, key: str = "Ticket") -> pd.DataFrame:
+                      wc_only: bool = False, key: str = "Ticket",
+                      mask_non_wc: bool = False) -> pd.DataFrame:
     """同行グループ(key 列が同じ人)の生存率と情報有無を付与する。
 
     統計は train_part のラベルのみから計算。target が集計対象内の行なら自分を除く(LOO)。
@@ -207,13 +315,24 @@ def add_group_feature(train_part: pd.DataFrame, target: pd.DataFrame,
     stats = pool.groupby(key)["Survived"].agg(["sum", "count"])
     out = target.copy()
     joined = out.join(stats, on=key)
-    in_pool = out.index.isin(pool.index).astype(float)
+    # 自分自身の除外(LOO)判定は PassengerId で行う。index だと train(0〜890)と
+    # test(0〜417)の番号が衝突し、test 行が誤って「自分がプールにいる」扱いになる
+    # (このバグで test の24人が証拠を失い37人の rate がずれていた。CV は fold 間で
+    # index が重複しないため無影響)
+    in_pool = out["PassengerId"].isin(pool["PassengerId"]).to_numpy().astype(float)
     own = out["Survived"].to_numpy(dtype=float) if "Survived" in out.columns else np.zeros(len(out))
     cnt = joined["count"].fillna(0).to_numpy() - in_pool
     ssum = joined["sum"].fillna(0).to_numpy() - np.nan_to_num(own) * in_pool
     rate = np.divide(ssum, cnt, out=np.full(len(out), np.nan), where=cnt > 0)
     out[f"{prefix}GroupSurvRate"] = np.where(np.isnan(rate), pool["Survived"].mean(), rate)
     out[f"{prefix}GroupInfo"] = (cnt > 0).astype(int)
+    if mask_non_wc:
+        # 大人の男性には証拠を渡さない(女性・子供の生死と大人の男性の生死は連動が弱く、
+        # rate=1 のグループでも大人の男性の生存率は 27.7%。モデルが rate=1 を
+        # 「生存の証拠」と誤読して FP を作るのを防ぐ)
+        men = ~is_woman_child(out)
+        out.loc[men, f"{prefix}GroupSurvRate"] = pool["Survived"].mean()
+        out.loc[men, f"{prefix}GroupInfo"] = 0
     return out
 
 
@@ -223,7 +342,8 @@ def apply_group(fs: dict, train_part: pd.DataFrame, target: pd.DataFrame) -> pd.
     if mode in ("all", "both"):
         target = add_group_feature(train_part, target, wc_only=False, key=key)
     if mode in ("wc", "both"):
-        target = add_group_feature(train_part, target, wc_only=True, key=key)
+        target = add_group_feature(train_part, target, wc_only=True, key=key,
+                                   mask_non_wc=fs.get("wc_mask_men", False))
     return target
 
 
@@ -262,7 +382,13 @@ def build_model(name: str, feature_set: str, params: dict | None = None) -> Pipe
         ),
     }
     steps = [("prep", preprocessor), ("clf", estimators[name]())]
-    if fs["title_age"]:
+    if fs["title_age"] == "pclass":
+        steps.insert(0, ("age", TitleAgeImputer(by=("Title", "Pclass"))))
+    elif fs["title_age"] == "fine":
+        steps.insert(0, ("age", TitleAgeImputer(by=("TitleFine",))))
+    elif fs["title_age"] == "reg":
+        steps.insert(0, ("age", RegAgeImputer()))
+    elif fs["title_age"]:
         steps.insert(0, ("age", TitleAgeImputer()))
     return Pipeline(steps)
 
@@ -296,6 +422,10 @@ def run_cv(model_name: str, fs_name: str, train_df: pd.DataFrame,
     if model_name == "ens":  # logreg と lgbm_t の確率平均
         return (run_cv("logreg", fs_name, train_df, seed=seed)
                 + run_cv("lgbm_t", fs_name, train_df, seed=seed)) / 2
+    if model_name == "avg3":  # logreg・rf・lgbm_t の確率平均(repeated CV ペア比較で10seed全勝)
+        return (run_cv("logreg", fs_name, train_df, seed=seed)
+                + run_cv("rf", fs_name, train_df, seed=seed)
+                + run_cv("lgbm_t", fs_name, train_df, seed=seed)) / 3
     fs = FEATURE_SETS[fs_name]
     cols = fs["num"] + fs["cat"]
     y = train_df["Survived"].to_numpy()
@@ -322,6 +452,10 @@ def predict_test(model_name: str, fs_name: str, train_df: pd.DataFrame,
     if model_name == "ens":
         return (predict_test("logreg", fs_name, train_df, test_df)
                 + predict_test("lgbm_t", fs_name, train_df, test_df)) / 2
+    if model_name == "avg3":
+        return (predict_test("logreg", fs_name, train_df, test_df)
+                + predict_test("rf", fs_name, train_df, test_df)
+                + predict_test("lgbm_t", fs_name, train_df, test_df)) / 3
     fs = FEATURE_SETS[fs_name]
     cols = fs["num"] + fs["cat"]
     tr, te = train_df, test_df
@@ -336,7 +470,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model",
-        choices=["all", "logreg", "rf", "lgbm", "lgbm_t", "ens"],
+        choices=["all", "logreg", "rf", "lgbm", "lgbm_t", "ens", "avg3"],
         default="all",
         help="all は CV 比較のみ。個別指定で submission も出力",
     )
